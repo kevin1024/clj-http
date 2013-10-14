@@ -3,6 +3,7 @@
         [clj-http.test.core :only [run-server]])
   (:require [clj-http.conn-mgr :as conn-mgr]
             [clj-http.core :as core]
+            [clj-http.client :as client]
             [ring.adapter.jetty :as ring])
   (:import (java.security KeyStore)
            (org.apache.http.conn.ssl SSLSocketFactory)
@@ -20,6 +21,12 @@
   (if (nil? (:ssl-client-cert req))
     {:status 403}
     {:status 200}))
+
+(defn mock-digest-auth-handler [req]
+  (if (contains? (:headers req) "authorization")
+    ;; if there is an authorization header, pass it through in the response body
+    {:status 200, :body (get (:headers req) "authorization")}
+    {:status 401, :headers {"WWW-Authenticate" "Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""}}))
 
 (deftest load-keystore
   (let [ks (conn-mgr/get-keystore "test-resources/keystore" nil "keykey")]
@@ -67,3 +74,35 @@
       (is false "request should have thrown an exception")
       (catch Exception e))
     (is @shutdown? "Connection manager has been shut down")))
+
+(deftest ^{:integration true} digest-authentication
+  (let [t (doto (Thread. #(ring/run-jetty mock-digest-auth-handler
+                                          {:port 18083})) .start)]
+    ;; wait for jetty to start up completely
+    (Thread/sleep 3000)
+    (let [resp (client/get "http://localhost:18083/get" {
+      :digest-auth  ["user" "pass"]})]
+      (is (= 200 (:status resp))))
+    ))
+
+(deftest ^{:integration true} digest-authentication-reuse
+  "make sure that once authenticated, the same digest is reused
+  within the same connection."
+  (let [t (doto (Thread. #(ring/run-jetty mock-digest-auth-handler
+                                          {:port 18083})) .start)]
+    ;; wait for jetty to start up completely
+    (Thread/sleep 3000)
+    (let [cm (conn-mgr/make-reusable-conn-manager {:timeout 10 :threads 1})]
+      ;; make the first request
+      (client/get "http://localhost:18083/get" {
+        :connection-manager cm
+        :digest-auth  ["user" "pass"]})
+      ;; make the second request, reusing the connection stored in cm
+      (let [resp2 (client/get "http://localhost:18083/get" {
+        :connection-manager cm
+        :digest-auth  ["user" "pass"]})]
+        ;; The request counter should have incremented.  This tells us
+        ;; that the same connection was reused, and that the request
+        ;; did not have to be re-authenticated.
+        (is (re-find #"nc=00000002" (:body resp2)))))) "The incremented request counter was not found.")
+      
